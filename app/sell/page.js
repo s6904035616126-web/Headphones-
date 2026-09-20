@@ -3,21 +3,20 @@
 import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
 
+// เกณฑ์แจ้งเตือนสต๊อกใกล้หมด
+const LOW_STOCK_THRESHOLD = 5;
+
 export default function SellPage() {
-  // รายการสินค้าทั้งหมด (ไว้แสดงใน dropdown)
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  // สินค้าที่เลือกและจำนวนที่จะขาย
   const [selectedProductId, setSelectedProductId] = useState("");
   const [quantity, setQuantity] = useState("");
 
-  // สถานะระหว่างกำลังบันทึกการขาย + ข้อความแจ้งผล
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
 
-  // โหลดรายการสินค้าจาก Supabase
   const fetchProducts = async () => {
     setLoading(true);
     const { data, error } = await supabase
@@ -38,12 +37,53 @@ export default function SellPage() {
     fetchProducts();
   }, []);
 
-  // หา object สินค้าที่กำลังถูกเลือกอยู่
   const selectedProduct = products.find((p) => p.id === selectedProductId);
-
-  // คำนวณยอดรวม = ราคา x จำนวน
   const qtyNumber = parseInt(quantity, 10) || 0;
   const totalPrice = selectedProduct ? selectedProduct.price * qtyNumber : 0;
+
+  // --- ส่วนที่เพิ่ม: ฟังก์ชันยิงข้อความแจ้งเตือนเข้า Telegram ผ่าน API Route ---
+  // ทำงานแบบ async/try-catch แยกจาก flow หลัก ถ้า error จะไม่กระทบการขาย
+  const sendTelegramMessage = async (text) => {
+    try {
+      await fetch("/api/telegram", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+    } catch (err) {
+      // แค่ log ไว้ ไม่ throw ต่อ เพื่อไม่ให้กระทบระบบขาย
+      console.error("ส่งแจ้งเตือน Telegram ไม่สำเร็จ:", err);
+    }
+  };
+
+  // --- ส่วนที่เพิ่ม: ประกอบข้อความแจ้งเตือน "มีรายการขายใหม่" + เช็คสต๊อกใกล้หมด ---
+  const notifyTelegramAfterSale = async (product, qty, total, newStock) => {
+    const time = new Date().toLocaleString("th-TH", {
+      dateStyle: "short",
+      timeStyle: "short",
+    });
+
+    const orderMessage =
+      `🛍️ <b>มีรายการขายใหม่!</b>\n` +
+      `- สินค้า: ${product.name}\n` +
+      `- จำนวน: ${qty} ชิ้น\n` +
+      `- ราคารวม: ${total} บาท\n` +
+      `- สต๊อกคงเหลือปัจจุบัน: ${newStock} ชิ้น\n` +
+      `- เวลา: ${time}`;
+
+    await sendTelegramMessage(orderMessage);
+
+    // ถ้าสต๊อกเหลือน้อยกว่าหรือเท่ากับเกณฑ์ ให้ยิงข้อความเตือนภัยเพิ่มอีกฉบับ
+    if (newStock <= LOW_STOCK_THRESHOLD) {
+      const lowStockMessage =
+        `🚨 <b>[เตือนภัย] สต๊อกสินค้าใกล้หมด!</b>\n` +
+        `- สินค้า: ${product.name}\n` +
+        `- คงเหลือเพียง: ${newStock} ชิ้น\n` +
+        `⚠️ กรุณาเติมสต๊อกสินค้าด่วน!`;
+
+      await sendTelegramMessage(lowStockMessage);
+    }
+  };
 
   const handleSell = async (e) => {
     e.preventDefault();
@@ -57,8 +97,6 @@ export default function SellPage() {
       alert("กรุณากรอกจำนวนให้ถูกต้อง");
       return;
     }
-
-    // ตรวจสอบ stock คงเหลือให้เพียงพอก่อนขาย
     if (qtyNumber > selectedProduct.stock) {
       alert(
         `สินค้าคงเหลือไม่พอ (คงเหลือ ${selectedProduct.stock} ${selectedProduct.unit})`
@@ -68,7 +106,6 @@ export default function SellPage() {
 
     setSubmitting(true);
 
-    // 1) บันทึกรายการขายลงตาราง sales
     const { error: saleError } = await supabase.from("sales").insert([
       {
         product_id: selectedProduct.id,
@@ -85,7 +122,6 @@ export default function SellPage() {
       return;
     }
 
-    // 2) อัปเดต stock สินค้าให้ลดลงตามจำนวนที่ขาย
     const newStock = selectedProduct.stock - qtyNumber;
     const { error: updateError } = await supabase
       .from("products")
@@ -98,7 +134,11 @@ export default function SellPage() {
       return;
     }
 
-    // สำเร็จ: แจ้งเตือนและรีเซ็ตฟอร์ม
+    // --- ส่วนที่เพิ่ม: ยิงแจ้งเตือน Telegram หลังตัดสต๊อกสำเร็จ ---
+    // ไม่ await แบบบล็อก flow หลัก และห่อด้วย try-catch ผ่านฟังก์ชันด้านบนแล้ว
+    // เพื่อไม่ให้ error จาก Telegram กระทบข้อความ "ขายสำเร็จ" บนเว็บ
+    notifyTelegramAfterSale(selectedProduct, qtyNumber, totalPrice, newStock);
+
     setMessage(
       `ขายสำเร็จ: ${selectedProduct.name} จำนวน ${qtyNumber} ${selectedProduct.unit} รวม ${totalPrice} บาท`
     );
@@ -106,7 +146,6 @@ export default function SellPage() {
     setQuantity("");
     setSubmitting(false);
 
-    // โหลดรายการสินค้าใหม่เพื่ออัปเดต stock ที่แสดงผล
     fetchProducts();
   };
 
@@ -123,7 +162,6 @@ export default function SellPage() {
             onSubmit={handleSell}
             style={{ display: "flex", flexDirection: "column", gap: "12px" }}
           >
-            {/* Dropdown เลือกสินค้า */}
             <div>
               <label>สินค้า: </label>
               <select
@@ -140,7 +178,6 @@ export default function SellPage() {
               </select>
             </div>
 
-            {/* ช่องกรอกจำนวน */}
             <div>
               <label>จำนวน: </label>
               <input
@@ -151,7 +188,6 @@ export default function SellPage() {
               />
             </div>
 
-            {/* แสดงยอดรวมอัตโนมัติ */}
             <div>
               <strong>ยอดรวม: {totalPrice.toFixed(2)} บาท</strong>
             </div>
